@@ -30,18 +30,16 @@ https://github.com/gurucharanmk/StepByStep-RAG
 
 ## Sample Execution Output
 
-**Query:** "What time does breakfast start?"
-
 **Retrieved context:**
 **Generated answer:**
 > According to our hotel's details, complimentary breakfast is served every
 > morning from 7:00 AM to 10:00 AM. Therefore, breakfast starts at 7:00 AM.
 
-### Query 2 — Cancellation Policy
-![Query 2 screenshot](./screenshots/query2-cancellation.png)
+### Query 1 — Breakfast Timing
+![Breakfast query](./screenshots/query2-cancellation.png)
 
-### Query 3 — Parking
-![Query 3 screenshot](./screenshots/query3-parking.png)
+### Query 2 — Cancellation Policy
+![Cancellation query](./screenshots/query3-parking.png)
 
 ## Observations, Limitations & Assumptions
 - No real vector database (e.g. FAISS, Chroma) — brute-force cosine
