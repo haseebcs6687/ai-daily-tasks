@@ -69,6 +69,12 @@ cd RAGStream
 pip install streamlit ollama numpy pdfplumber
 ```
 
+### (Optional) Install Advanced Dependencies for Hybrid Search
+For faster startups and **Hybrid Search** (combining vector search with BM25 keyword matching for exact IDs), install these two additional packages. If you skip this, the app will automatically fall back to basic in-memory mode!
+```bash
+pip install chromadb rank_bm25
+```
+
 Or with Poetry:
 ```bash
 cd RAGStream

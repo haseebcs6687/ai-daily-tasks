@@ -4,10 +4,20 @@ import numpy as np
 import ollama
 import time
 import re
+import os
+import hashlib
 from typing import List, Dict, Tuple, Any, Iterator, Union
 from datetime import datetime
 from memory_monitor import render_memory_bar
 from load_documents import load_all_from_docs_folder, load_uploaded_file, list_loaded_documents
+
+# Try to import advanced libraries for DB and Hybrid Search
+try:
+    import chromadb
+    from rank_bm25 import BM25Okapi
+    ADVANCED_MODE = True
+except ImportError:
+    ADVANCED_MODE = False
 
 # ── Default built-in content (used if no docs folder documents are found) ──────
 # This is a compact summary of NIST CSF 2.0 key concepts.
@@ -53,14 +63,54 @@ class ConvoRAG:
         self.documents = documents
         self.embedding_model = embedding_model
         self.llm_model = llm_model
+        self.advanced_mode = ADVANCED_MODE
 
-        st.write(f"Initializing with {len(documents)} document chunks")
-        st.write(
-            f"Using embedding model: {embedding_model}, LLM model: {llm_model}"
-        )
+        mode_str = "Advanced (Hybrid + DB)" if self.advanced_mode else "Basic (In-Memory)"
+        st.write(f"Initializing with {len(documents)} document chunks in {mode_str} mode")
+        st.write(f"Using embedding model: {embedding_model}, LLM model: {llm_model}")
 
-        with st.spinner("Embedding documents... (this may take a minute for large documents)"):
-            self.document_embeddings = [self.embed_text(doc) for doc in documents]
+        self.document_embeddings = []
+        
+        if self.advanced_mode:
+            # --- ADVANCED MODE (ChromaDB + BM25) ---
+            with st.spinner("Initializing ChromaDB and BM25 index..."):
+                self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
+                self.collection = self.chroma_client.get_or_create_collection(name="cyber_standards")
+                
+                # Check if documents are already in the DB by hashing the full document text to create an ID prefix
+                full_text = "".join(self.documents)
+                doc_hash = hashlib.md5(full_text.encode('utf-8')).hexdigest()
+                
+                # Check if we need to add these documents
+                existing_count = self.collection.count()
+                st.write(f"Found {existing_count} existing chunks in the database.")
+                
+                # For simplicity in this demo, if the count is different or 0, we rebuild
+                if existing_count == 0 or existing_count != len(self.documents):
+                    st.write("Generating and storing new embeddings in the database...")
+                    # Generate embeddings
+                    for i, doc in enumerate(documents):
+                        try:
+                            # We still use Ollama for embedding generation to keep it consistent
+                            response = ollama.embeddings(model=self.embedding_model, prompt=doc)
+                            self.collection.add(
+                                embeddings=[response["embedding"]],
+                                documents=[doc],
+                                metadatas=[{"chunk_id": i}],
+                                ids=[f"chunk_{doc_hash}_{i}"]
+                            )
+                        except Exception as e:
+                            st.error(f"Error embedding chunk {i}: {str(e)}")
+                            
+                # Initialize BM25 for Keyword Search
+                tokenized_corpus = [doc.lower().split() for doc in self.documents]
+                self.bm25 = BM25Okapi(tokenized_corpus)
+                st.write("Hybrid Search (BM25 + Vector) ready.")
+                
+        else:
+            # --- BASIC MODE (NumPy In-Memory) ---
+            with st.spinner("Embedding documents... (this may take a minute for large documents)"):
+                self.document_embeddings = [self.embed_text(doc) for doc in documents]
 
         self.conversation_history = []
 
@@ -116,28 +166,77 @@ class ConvoRAG:
 
     def search(self, query: str, top_k: int = 5) -> Tuple[str, float]:
         """Search for the most relevant documents based on cosine similarity of embeddings."""
-        if not self.documents or not self.document_embeddings:
+        if not self.documents:
             return "No documents available.", 0.0
 
         try:
             st.write(f"Searching for: '{query}'")
-            query_embedding = self.embed_text(query)
+            
+            if self.advanced_mode:
+                # --- HYBRID SEARCH (ChromaDB Vector + BM25 Keyword) ---
+                query_embedding = self.embed_text(query)
+                
+                # 1. Vector Search
+                vector_results = self.collection.query(
+                    query_embeddings=[query_embedding.tolist()],
+                    n_results=top_k
+                )
+                
+                # Extract vector indices (from our metadata) and scores (Chroma returns distances, smaller is better)
+                vector_indices = [meta["chunk_id"] for meta in vector_results["metadatas"][0]] if vector_results["metadatas"] else []
+                # Convert distance to a pseudo-similarity score for thresholding later
+                vector_scores = [1.0 - (d / 2.0) for d in vector_results["distances"][0]] if vector_results["distances"] else []
+                
+                # 2. Keyword Search (BM25)
+                tokenized_query = query.lower().split()
+                bm25_scores = self.bm25.get_scores(tokenized_query)
+                bm25_indices = self.topk(bm25_scores.tolist(), top_k)
+                
+                # 3. Combine using Reciprocal Rank Fusion (RRF)
+                k_rrf = 60
+                combined_scores = {}
+                
+                for rank, idx in enumerate(vector_indices):
+                    combined_scores[idx] = combined_scores.get(idx, 0.0) + (1.0 / (k_rrf + rank + 1))
+                    
+                for rank, idx in enumerate(bm25_indices):
+                    combined_scores[idx] = combined_scores.get(idx, 0.0) + (1.0 / (k_rrf + rank + 1))
+                
+                # Sort combined results
+                sorted_indices = sorted(combined_scores.keys(), key=lambda x: combined_scores[x], reverse=True)[:top_k]
+                
+                if not sorted_indices:
+                    return "No relevant documents found.", 0.0
+                    
+                result = "\n".join([self.documents[i] for i in sorted_indices])
+                # Return the best vector score for the threshold check if available, else a synthetic score
+                best_score = vector_scores[0] if vector_scores else 0.5 
+                st.write("Hybrid search results generated.")
+                return result, best_score
+                
+            else:
+                # --- BASIC SEARCH (NumPy Cosine Similarity) ---
+                if not self.document_embeddings:
+                    return "No documents available.", 0.0
+                    
+                query_embedding = self.embed_text(query)
 
-            similarities = []
-            for doc_embedding in self.document_embeddings:
-                similarity = self.cosine_similarity(query_embedding, doc_embedding)
-                similarities.append(similarity)
+                similarities = []
+                for doc_embedding in self.document_embeddings:
+                    similarity = self.cosine_similarity(query_embedding, doc_embedding)
+                    similarities.append(similarity)
 
-            if not similarities:
-                return "No similarities found.", 0.0
+                if not similarities:
+                    return "No similarities found.", 0.0
 
-            topk_indices = self.topk(similarities, top_k)
+                topk_indices = self.topk(similarities, top_k)
 
-            if not topk_indices:
-                return "No relevant documents found.", 0.0
+                if not topk_indices:
+                    return "No relevant documents found.", 0.0
 
-            result = "\n".join([self.documents[i] for i in topk_indices])
-            return result, similarities[topk_indices[0]] if topk_indices else 0.0
+                result = "\n".join([self.documents[i] for i in topk_indices])
+                return result, similarities[topk_indices[0]] if topk_indices else 0.0
+                
         except Exception as e:
             st.error(f"Error in document search: {str(e)}")
             return "Error occurred while searching documents.", 0.0
@@ -736,6 +835,12 @@ def main():
 
             *Ask any question about cybersecurity standards and frameworks.*
             """)
+            
+            st.markdown("---")
+            if 'ADVANCED_MODE' in globals() and ADVANCED_MODE:
+                st.success("🚀 **Advanced Mode Active**\n\nUsing ChromaDB for persistence and Hybrid Search (Vector + BM25).")
+            else:
+                st.info("ℹ️ **Basic Mode Active**\n\nUsing in-memory numpy search. Install `chromadb` and `rank_bm25` for persistent Hybrid Search.")
 
     # Keep the RAG engine's model in sync with the sidebar selection
     if st.session_state.rag_system is not None:
